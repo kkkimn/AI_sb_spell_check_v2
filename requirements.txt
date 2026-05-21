@@ -1,10 +1,10 @@
 streamlit
 openai
+moviepy==1.0.3
 pandas
-numpy
 opencv-python-headless
+numpy
+openpyxl
 pillow
 python-pptx
-PyMuPDF
-openpyxl
 python-dotenv

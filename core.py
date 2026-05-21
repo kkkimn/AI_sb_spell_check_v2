@@ -1363,17 +1363,108 @@ def get_pptx_slide_images(pptx_bytes, slide_nums):
     PPTX 바이트 데이터를 임시 저장하고 지정된 슬라이드 번호(1-indexed)들의
     이미지를 추출하여 딕셔너리로 반환합니다. (키: slide_num, 값: image_bytes)
 
-    Streamlit Cloud/Linux 환경에서는 Windows 전용 COM(win32com/pythoncom)을 사용할 수 없으므로
-    이미지 추출을 건너뛰고 빈 딕셔너리를 반환합니다.
+    Streamlit Cloud/Linux 대응:
+    - 1순위: LibreOffice(headless)로 PPTX → PDF 변환 후 PyMuPDF로 페이지 이미지를 추출
+    - 2순위: Windows 환경에서는 기존 PowerPoint COM(win32com) 방식으로 폴백
+    - 둘 다 불가능하면 앱이 멈추지 않도록 빈 dict를 반환
+
+    Streamlit Cloud에서 PPTX 이미지 추출을 사용하려면 저장소 루트에 packages.txt를 만들고
+    다음 한 줄을 추가해야 합니다:
+        libreoffice
     """
+    import os
     import platform
+    import shutil
+    import subprocess
+    import tempfile
 
     img_dict = {}
+    if not pptx_bytes or not slide_nums:
+        return img_dict
 
-    # Streamlit Cloud는 Linux 환경이므로 PowerPoint COM 자동화를 사용할 수 없습니다.
-    # 이 경우 앱이 중단되지 않도록 이미지 캐시만 비워두고 나머지 분석을 계속 진행합니다.
+    # 중복 제거 + 정수화 + 정렬
+    try:
+        target_slides = sorted({int(s) for s in slide_nums if int(s) >= 1})
+    except Exception:
+        target_slides = []
+    if not target_slides:
+        return img_dict
+
+    # ─────────────────────────────────────────────
+    # 1) Streamlit Cloud/Linux 권장 방식: LibreOffice → PDF → PyMuPDF 이미지
+    # ─────────────────────────────────────────────
+    libreoffice_bin = (
+        shutil.which("libreoffice")
+        or shutil.which("soffice")
+        or shutil.which("/usr/bin/libreoffice")
+        or shutil.which("/usr/bin/soffice")
+    )
+
+    if libreoffice_bin:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            temp_pptx = os.path.join(tmpdir, "temp_extract.pptx")
+            with open(temp_pptx, "wb") as f:
+                f.write(pptx_bytes)
+
+            try:
+                cmd = [
+                    libreoffice_bin,
+                    "--headless",
+                    "--convert-to", "pdf",
+                    "--outdir", tmpdir,
+                    temp_pptx,
+                ]
+                result = subprocess.run(
+                    cmd,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=180,
+                )
+
+                if result.returncode != 0:
+                    err = (result.stderr or result.stdout or "").strip()
+                    print(f"[안내] LibreOffice PPTX→PDF 변환 실패: {err[:300]}")
+                else:
+                    # LibreOffice가 생성한 PDF 찾기
+                    pdf_candidates = [
+                        os.path.join(tmpdir, name)
+                        for name in os.listdir(tmpdir)
+                        if name.lower().endswith(".pdf")
+                    ]
+                    pdf_path = pdf_candidates[0] if pdf_candidates else None
+
+                    if not pdf_path or not os.path.exists(pdf_path):
+                        print("[안내] LibreOffice 변환 후 PDF 파일을 찾지 못했습니다.")
+                    else:
+                        pdf_doc = fitz.open(pdf_path)
+                        try:
+                            for s_num in target_slides:
+                                page_idx = s_num - 1
+                                if 0 <= page_idx < len(pdf_doc):
+                                    page = pdf_doc[page_idx]
+                                    # 기존 COM 방식과 비슷하게 가로 640px 기준 렌더링
+                                    rect = page.rect
+                                    zoom = 640 / rect.width if rect.width else 1.0
+                                    zoom = max(0.5, min(3.0, zoom))
+                                    mat = fitz.Matrix(zoom, zoom)
+                                    pix = page.get_pixmap(matrix=mat, alpha=False)
+                                    img_dict[s_num] = pix.tobytes("png")
+                        finally:
+                            pdf_doc.close()
+
+                        return img_dict
+
+            except subprocess.TimeoutExpired:
+                print("[안내] LibreOffice PPTX→PDF 변환 시간이 초과되어 슬라이드 이미지 추출을 건너뜁니다.")
+            except Exception as e:
+                print(f"[안내] LibreOffice 방식 PPTX 이미지 추출 실패: {e}")
+
+    # ─────────────────────────────────────────────
+    # 2) Windows 로컬 실행 폴백: PowerPoint COM
+    # ─────────────────────────────────────────────
     if platform.system() != "Windows":
-        print("[안내] Streamlit Cloud/Linux에서는 PPTX 슬라이드 이미지 변환을 건너뜁니다.")
+        print("[안내] LibreOffice가 없고 Windows 환경도 아니어서 PPTX 슬라이드 이미지 변환을 건너뜁니다.")
         return img_dict
 
     try:
@@ -1397,11 +1488,10 @@ def get_pptx_slide_images(pptx_bytes, slide_nums):
             powerpoint = win32com.client.DispatchEx("Powerpoint.Application")
             presentation = powerpoint.Presentations.Open(temp_pptx, ReadOnly=True, WithWindow=False)
 
-            for s_num in slide_nums:
+            for s_num in target_slides:
                 if 1 <= s_num <= presentation.Slides.Count:
                     slide = presentation.Slides(s_num)
                     img_path = os.path.join(tmpdir, f"slide_{s_num}.png")
-                    # 적절한 해상도로 추출 (가로 640px)
                     slide.Export(img_path, "PNG", 640, 360)
                     if os.path.exists(img_path):
                         with open(img_path, "rb") as f:
@@ -1429,7 +1519,6 @@ def get_pptx_slide_images(pptx_bytes, slide_nums):
             pass
 
     return img_dict
-
 
 # ==========================================
 # 지식 베이스(사전 학습) 생성 및 내용 검토 (AI 호출)
